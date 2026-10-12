@@ -1,0 +1,20 @@
+# 密钥与敏感信息
+*.keystore
+*.jks
+*.idsig
+
+# 构建产物
+apk/build/
+apk/gen/
+apk/classes/
+apk/dex/
+*.apk
+!release/*.apk
+
+# 临时文件
+*.log
+img_*.jpg
+ch38_*.jpg
+page.html
+m_page.html
+ch1.html
