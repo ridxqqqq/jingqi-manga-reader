@@ -73,6 +73,11 @@ public class MainActivity extends Activity {
     private ProgressBar loadingBar;
     private Runnable hideRunnable;
 
+    // ---- 自动阅读 ----
+    private TextView autoBtn;
+    private volatile boolean autoReading = false;
+    private static final int DEFAULT_CHAPTER_SEC = 60;
+
     private List<Chapter> chapters = new ArrayList<Chapter>();
     private volatile int curIndex = -1;
     private volatile int pendingRestoreImg = 0; // 页面加载完后要跳回的图序号：0 = 回顶部
@@ -114,6 +119,15 @@ public class MainActivity extends Activity {
             int idx = position - catalogList.getHeaderViewsCount();
             if (idx >= 0 && idx < chapters.size()) openChapter(idx);
         });
+        // 长按章节：设置该章的自定义阅读时间
+        catalogList.setOnItemLongClickListener((parent, view, position, id) -> {
+            int idx = position - catalogList.getHeaderViewsCount();
+            if (idx >= 0 && idx < chapters.size()) {
+                showChapterTimeDialog(idx);
+                return true;
+            }
+            return false;
+        });
         root.addView(catalogList, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
@@ -137,6 +151,8 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 restoreProgress();
+                // 自动阅读进行中：换章/重试加载完成后用新章节的时间重新计时
+                if (autoReading) ui.postDelayed(() -> injectAuto(), 900);
             }
         });
         root.addView(reader, new FrameLayout.LayoutParams(
@@ -174,6 +190,17 @@ public class MainActivity extends Activity {
         pageBadge.setTextSize(13);
         pageBadge.setPadding(dp(10), 0, 0, 0);
         topBar.addView(pageBadge);
+
+        // 自动阅读开关：点击 开/停；长按 设置全局默认时长
+        autoBtn = new TextView(this);
+        autoBtn.setText("自动");
+        autoBtn.setTextColor(0xFF9AA3B5);
+        autoBtn.setTextSize(13);
+        autoBtn.setTypeface(Typeface.DEFAULT_BOLD);
+        autoBtn.setPadding(dp(10), 0, 0, 0);
+        autoBtn.setOnClickListener(v -> toggleAutoRead());
+        autoBtn.setOnLongClickListener(v -> { showDefaultTimeDialog(); return true; });
+        topBar.addView(autoBtn);
 
         root.addView(topBar, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -438,6 +465,7 @@ public class MainActivity extends Activity {
     }
 
     private void showCatalog() {
+        stopAutoRead(false);
         readerVisible = false;
         saveProgressNow();
         reader.stopLoading();
@@ -542,8 +570,9 @@ public class MainActivity extends Activity {
         sb.append("img{display:block;width:100%;height:auto;margin:0;padding:0;opacity:0;transition:opacity .25s;}");
         sb.append("img.ld{opacity:1;}");
         sb.append(".tip{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:#5a6377;font:12px sans-serif;}");
-        sb.append(".end{padding:34px 0 80px;color:#8a93a6;font:14px sans-serif;text-align:center;}");
+        sb.append(".end{padding:34px 0 10px;color:#8a93a6;font:14px sans-serif;text-align:center;}");
         sb.append(".end b{display:block;color:#FF6B3D;font-size:16px;margin-bottom:8px;}");
+        sb.append(".ctime{color:#5a6377;font:12px sans-serif;text-align:center;padding:0 0 80px;}");
         sb.append("</style></head><body>");
         for (String u : imgs) {
             sb.append("<div class='p'><span class='tip'>加载中…</span><img data-src='")
@@ -552,6 +581,11 @@ public class MainActivity extends Activity {
         sb.append("<div class='end'><b>本章完</b>")
           .append(curIndex < chapters.size() - 1 ? "点按任意位置进入下一话" : "已是最新一话")
           .append("</div>");
+        // 每个章节下面：本章阅读时间（自动阅读该章总时长），点按可自定义
+        int ctSec = chapterSec(c.pid);
+        sb.append("<div class='ctime' id='ctime'>本章阅读时间：").append(ctSec).append(" 秒")
+          .append(sp.getInt("auto_ct_" + c.pid, 0) > 0 ? "（自定义）" : "（默认）")
+          .append(" · 点按设置</div>");
         sb.append("<script>");
         sb.append("var TOTAL=").append(imgs.length).append(";var LOADED=0;");
         sb.append("var ims=[].slice.call(document.images);");
@@ -584,6 +618,23 @@ public class MainActivity extends Activity {
         sb.append("Android.toggle();});");
         sb.append("var end=document.querySelector('.end');");
         sb.append("if(end)end.addEventListener('click',function(e){e.stopPropagation();Android.nextChapter();});");
+        // 章末“本章阅读时间”点按 → 原生设置弹窗
+        sb.append("var ctm=document.getElementById('ctime');");
+        sb.append("if(ctm)ctm.addEventListener('click',function(e){e.stopPropagation();Android.setChapterTime();});");
+        // 自动阅读引擎：按“剩余距离 / 剩余时间”自适应匀速滚动，读完自动进下一话。
+        // 图片懒加载导致总高度增长时速度自动修正；手动滑动也不会打乱节奏。
+        sb.append("window.__auto={t:null};");
+        sb.append("window.__autoStop=function(){if(window.__auto.t){clearInterval(window.__auto.t);window.__auto.t=null;}};");
+        sb.append("window.__autoStart=function(sec){window.__autoStop();");
+        sb.append("var d=document.documentElement;var t0=Date.now(),last=t0;");
+        sb.append("window.__auto.t=setInterval(function(){");
+        sb.append("var now=Date.now();var dt=(now-last)/1000;last=now;");
+        sb.append("var max=d.scrollHeight-window.innerHeight;");
+        sb.append("var st=d.scrollTop||document.body.scrollTop;");
+        sb.append("var rt=sec-(now-t0)/1000;");
+        sb.append("if(rt<=0||st>=max-4){window.__autoStop();try{Android.autoNext();}catch(e){}return;}");
+        sb.append("var v=(max-st)/Math.max(rt,0.5);if(v<15)v=15;");
+        sb.append("window.scrollBy(0,v*dt);},50);};");
         sb.append("</script></body></html>");
 
         reader.loadDataWithBaseURL(null, sb.toString(), "text/html", "utf-8", null);
@@ -629,6 +680,130 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ================= 自动阅读 =================
+
+    /** 本章生效的阅读时间（秒）：优先该章自定义，否则全局默认 */
+    private int chapterSec(int pid) {
+        int v = sp.getInt("auto_ct_" + pid, 0);
+        return v > 0 ? v : sp.getInt("auto_default_sec", DEFAULT_CHAPTER_SEC);
+    }
+
+    private void toggleAutoRead() {
+        if (autoReading) stopAutoRead(true);
+        else startAutoRead();
+    }
+
+    private void startAutoRead() {
+        if (!readerVisible || curIndex < 0 || curIndex >= chapters.size() || switching) {
+            toast("请等章节加载完成后再开启");
+            return;
+        }
+        autoReading = true;
+        refreshAutoBtn();
+        injectAuto();
+        toast("自动阅读开启：" + chapterSec(chapters.get(curIndex).pid) + " 秒/章");
+    }
+
+    private void stopAutoRead(boolean showToast) {
+        if (!autoReading) return;
+        autoReading = false;
+        try { reader.evaluateJavascript("window.__autoStop&&__autoStop();", null); }
+        catch (Exception ignored) {}
+        refreshAutoBtn();
+        if (showToast) toast("自动阅读已停止");
+    }
+
+    /** 用当前章节的生效时间启动/重启 JS 自动滚动 */
+    private void injectAuto() {
+        if (!autoReading || curIndex < 0 || curIndex >= chapters.size()) return;
+        int sec = chapterSec(chapters.get(curIndex).pid);
+        reader.evaluateJavascript("window.__autoStart&&__autoStart(" + sec + ");", null);
+    }
+
+    private void refreshAutoBtn() {
+        if (autoBtn == null) return;
+        autoBtn.setText(autoReading ? "停止" : "自动");
+        autoBtn.setTextColor(autoReading ? ORANGE : 0xFF9AA3B5);
+    }
+
+    /** 设置某章的自定义阅读时间（秒），可清除恢复默认 */
+    private void showChapterTimeDialog(final int chapterIdx) {
+        if (chapterIdx < 0 || chapterIdx >= chapters.size()) return;
+        final Chapter c = chapters.get(chapterIdx);
+        final android.widget.EditText et = new android.widget.EditText(this);
+        et.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        int cur = sp.getInt("auto_ct_" + c.pid, 0);
+        if (cur > 0) et.setText(String.valueOf(cur));
+        et.setHint("秒（5~3600），当前默认 " + sp.getInt("auto_default_sec", DEFAULT_CHAPTER_SEC) + " 秒");
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setPadding(dp(20), dp(8), dp(20), 0);
+        wrap.addView(et);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("本章阅读时间 · " + c.title)
+                .setView(wrap)
+                .setPositiveButton("确定", (d, w) -> {
+                    try {
+                        int v = Integer.parseInt(et.getText().toString().trim());
+                        v = Math.max(5, Math.min(3600, v));
+                        sp.edit().putInt("auto_ct_" + c.pid, v).apply();
+                        toast("「" + c.title + "」阅读时间设为 " + v + " 秒");
+                        adapter.notifyDataSetChanged();
+                        onChapterTimeChanged();
+                    } catch (Exception e) {
+                        toast("请输入数字秒数");
+                    }
+                })
+                .setNeutralButton("清除自定义", (d, w) -> {
+                    sp.edit().remove("auto_ct_" + c.pid).apply();
+                    toast("已恢复默认时间");
+                    adapter.notifyDataSetChanged();
+                    onChapterTimeChanged();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /** 设置全局默认每章阅读时间（长按“自动”按钮触发） */
+    private void showDefaultTimeDialog() {
+        final android.widget.EditText et = new android.widget.EditText(this);
+        et.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        et.setText(String.valueOf(sp.getInt("auto_default_sec", DEFAULT_CHAPTER_SEC)));
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.setPadding(dp(20), dp(8), dp(20), 0);
+        wrap.addView(et);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("默认每章阅读时间（秒）")
+                .setView(wrap)
+                .setPositiveButton("确定", (d, w) -> {
+                    try {
+                        int v = Integer.parseInt(et.getText().toString().trim());
+                        v = Math.max(5, Math.min(3600, v));
+                        sp.edit().putInt("auto_default_sec", v).apply();
+                        toast("默认时间设为 " + v + " 秒/章");
+                        adapter.notifyDataSetChanged();
+                        onChapterTimeChanged();
+                    } catch (Exception e) {
+                        toast("请输入数字秒数");
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /** 时间变更后：刷新章末标签；自动阅读进行中则用新时间重新计时 */
+    private void onChapterTimeChanged() {
+        if (!readerVisible || curIndex < 0 || curIndex >= chapters.size()) return;
+        Chapter c = chapters.get(curIndex);
+        String label = "本章阅读时间：" + chapterSec(c.pid) + " 秒"
+                + (sp.getInt("auto_ct_" + c.pid, 0) > 0 ? "（自定义）" : "（默认）")
+                + " · 点按设置";
+        try {
+            reader.evaluateJavascript("var e=document.getElementById('ctime');if(e)e.textContent="
+                    + JSONObject.quote(label) + ";", null);
+        } catch (Exception ignored) {}
+        if (autoReading) injectAuto();
+    }
+
     private void toggleBar() {
         if (!readerVisible) return;
         if (hideRunnable != null) ui.removeCallbacks(hideRunnable);
@@ -650,6 +825,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        stopAutoRead(false);
         saveProgressNow();
     }
 
@@ -732,6 +908,9 @@ public class MainActivity extends Activity {
             } else {
                 tv.setTextColor(0xFFD8DEE9);
             }
+            // 设了自定义阅读时间的章节：显示 ⏱ 角标
+            int csec = sp.getInt("auto_ct_" + c.pid, 0);
+            if (csec > 0) row.addView(makeBadge(csec + "s", false));
             TextView idx = new TextView(MainActivity.this);
             idx.setText((position + 1) + "");
             idx.setTextColor(0xFF4A5266);
@@ -796,6 +975,26 @@ public class MainActivity extends Activity {
                 if (curIndex > 0) openChapter(curIndex - 1);
                 else toast("已经是第一话");
             });
+        }
+
+        /** 自动阅读：本章滚完 → 进下一话；已是最新则停止 */
+        @JavascriptInterface
+        public void autoNext() {
+            ui.post(() -> {
+                if (!autoReading) return;
+                if (curIndex < chapters.size() - 1) {
+                    openChapter(curIndex + 1); // onPageFinished 里会重启自动滚动
+                } else {
+                    stopAutoRead(false);
+                    toast("已是最新一话，自动阅读结束");
+                }
+            });
+        }
+
+        /** 章末“本章阅读时间”点击 → 弹出设置窗口 */
+        @JavascriptInterface
+        public void setChapterTime() {
+            ui.post(() -> { if (curIndex >= 0) showChapterTimeDialog(curIndex); });
         }
     }
 }
