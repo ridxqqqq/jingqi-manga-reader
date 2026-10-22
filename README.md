@@ -86,10 +86,10 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 ├── gen_icon.py                # 生成启动图标（Pillow）
 ├── apk/
 │   ├── AndroidManifest.xml
-│   ├── src/MainActivity.java  # 全部逻辑：目录解析 / WebView 阅读器 / 进度管理
+│   ├── src/MainActivity.java  # 全部逻辑：目录解析 / WebView 阅读器 / 自动阅读 / 进度管理
 │   ├── assets/catalog.json    # 内置 1838 话目录（旧→新）
 │   └── res/                   # 图标、主题、网络安全配置
-└── release/jingqi-v1.1.2.apk  # 已签名安装包
+└── release/jingqi-v1.2.0.apk  # 已签名安装包
 ```
 
 ## 签名信息
