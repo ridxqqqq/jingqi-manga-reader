@@ -88,7 +88,8 @@ public class MainActivity extends Activity {
     private volatile boolean extracting = false;
     private int extractTries = 0;
     private int extractingIndex = -1;
-    private boolean webAltTried = false;
+    private String[] extractCandidates;
+    private int webChanIdx = 0;
     private Runnable extractTimeout;
 
     static class Chapter {
@@ -167,14 +168,8 @@ public class MainActivity extends Activity {
 
             @Override
             public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
-                // 备用通道内某协议失败 → 换 http/https 再试一次
-                if (extracting && !webAltTried) {
-                    webAltTried = true;
-                    String u = failingUrl != null && failingUrl.startsWith("http")
-                            ? failingUrl : chapters.get(extractingIndex).url;
-                    if (u.startsWith("http://")) view.loadUrl("https://" + u.substring(7));
-                    else if (u.startsWith("https://")) view.loadUrl("http://" + u.substring(8));
-                }
+                // 备用通道内某候选失败 → 切换下一候选（主域/镜像域 × http/https）
+                if (extracting) advanceWebViewChannel(view);
             }
         });
         root.addView(reader, new FrameLayout.LayoutParams(
@@ -527,48 +522,53 @@ public class MainActivity extends Activity {
 
         final String url = c.url;
         new Thread(() -> {
-            // 通道候选：http 主通道 + https 备用（站点 TLS 不稳定，但部分网络下可用）
-            java.util.LinkedHashSet<String> chans = new java.util.LinkedHashSet<String>();
-            chans.add(url);
-            if (url.startsWith("http://")) chans.add("https://" + url.substring(7));
+            String[] chans = buildChannels(url);
             Exception lastErr = null;
             int attempt = 0;
             for (String chan : chans) {
-                for (int pass = 0; pass < 2; pass++, attempt++) {
-                    try {
-                        if (attempt > 0) Thread.sleep(1200L * (pass + 1));
-                        HttpURLConnection conn = (HttpURLConnection) new URL(chan).openConnection();
-                        conn.setConnectTimeout(10000);
-                        conn.setReadTimeout(20000);
-                        conn.setInstanceFollowRedirects(true);
-                        conn.setRequestProperty("User-Agent", UA);
-                        conn.setRequestProperty("Accept", "*/*");
-                        conn.setRequestProperty("Referer", "http://m.gugu5.cc/");
-                        // 禁用长连接复用，避免 stale 连接导致 unexpected end of stream
-                        conn.setRequestProperty("Connection", "close");
-                        InputStream in = conn.getInputStream();
-                        ByteArrayOutputStream buf = new ByteArrayOutputStream();
-                        byte[] t = new byte[8192];
-                        int n;
-                        while ((n = in.read(t)) > 0) buf.write(t, 0, n);
-                        in.close();
-                        String html = decode(buf.toByteArray());
-                        Matcher m = P_MURL.matcher(html);
-                        if (!m.find()) throw new Exception("页面解析失败");
-                        byte[] decoded = Base64.decode(m.group(1).trim(), Base64.DEFAULT);
-                        String joined = new String(decoded, StandardCharsets.UTF_8);
-                        final String[][] L = buildImgLists(joined);
-                        if (L[0].length == 0) throw new Exception("未找到图片");
-                        ui.post(() -> onChapterLoaded(index, L[0], L[1], L[2]));
-                        return;
-                    } catch (Exception e) {
-                        lastErr = e;
-                    }
+                try {
+                    if (attempt++ > 0) Thread.sleep(1000L);
+                    HttpURLConnection conn = (HttpURLConnection) new URL(chan).openConnection();
+                    conn.setConnectTimeout(10000);
+                    conn.setReadTimeout(20000);
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setRequestProperty("User-Agent", UA);
+                    conn.setRequestProperty("Accept", "*/*");
+                    conn.setRequestProperty("Referer", "http://m.gugu5.cc/");
+                    // 禁用长连接复用，避免 stale 连接导致 unexpected end of stream
+                    conn.setRequestProperty("Connection", "close");
+                    InputStream in = conn.getInputStream();
+                    ByteArrayOutputStream buf = new ByteArrayOutputStream();
+                    byte[] t = new byte[8192];
+                    int n;
+                    while ((n = in.read(t)) > 0) buf.write(t, 0, n);
+                    in.close();
+                    String html = decode(buf.toByteArray());
+                    Matcher m = P_MURL.matcher(html);
+                    if (!m.find()) throw new Exception("页面解析失败");
+                    byte[] decoded = Base64.decode(m.group(1).trim(), Base64.DEFAULT);
+                    String joined = new String(decoded, StandardCharsets.UTF_8);
+                    final String[][] L = buildImgLists(joined);
+                    if (L[0].length == 0) throw new Exception("未找到图片");
+                    ui.post(() -> onChapterLoaded(index, L[0], L[1], L[2]));
+                    return;
+                } catch (Exception e) {
+                    lastErr = e;
                 }
             }
-            // 所有 HTTP 通道失败 → WebView 浏览器引擎通道（网络栈不同，可绕过连接重置）
+            // 所有 HTTP 通道失败 → WebView 浏览器引擎通道（网络栈不同，可绕过连接重置/域名阻断）
             ui.post(() -> startWebViewExtraction(index));
         }).start();
+    }
+
+    private String[] buildChannels(String url) {
+        // 主域/镜像域 × http/https：单个域名被网络阻断时可整体切换
+        String path = url.replaceAll("^https?://[^/]+/", "/");
+        String[] hosts = {"m.yueman1.cc", "m.yueman.cc"};
+        java.util.LinkedHashSet<String> chans = new java.util.LinkedHashSet<String>();
+        for (String host : hosts) chans.add("http://" + host + path);
+        for (String host : hosts) chans.add("https://" + host + path);
+        return chans.toArray(new String[0]);
     }
 
     private String[][] buildImgLists(String joined) {
@@ -597,14 +597,26 @@ public class MainActivity extends Activity {
         extracting = true;
         extractTries = 0;
         extractingIndex = index;
-        webAltTried = false;
+        extractCandidates = buildChannels(chapters.get(index).url);
+        webChanIdx = 0;
         showLoading(true, "正在加载 " + chapters.get(index).title + "（备用通道）");
         reader.getSettings().setBlockNetworkImage(true);
-        reader.loadUrl(chapters.get(index).url);
+        reader.loadUrl(extractCandidates[0]);
         extractTimeout = () -> {
             if (extracting) showNetError();
         };
-        ui.postDelayed(extractTimeout, 25000);
+        ui.postDelayed(extractTimeout, 45000);
+    }
+
+    private void advanceWebViewChannel(WebView view) {
+        if (!extracting) return;
+        webChanIdx++;
+        if (extractCandidates != null && webChanIdx < extractCandidates.length) {
+            extractTries = 0;
+            view.loadUrl(extractCandidates[webChanIdx]);
+        } else {
+            showNetError();
+        }
     }
 
     private void tryExtract(WebView view) {
@@ -638,7 +650,7 @@ public class MainActivity extends Activity {
                     } else if (extracting && extractTries++ < 6) {
                         view.postDelayed(() -> tryExtract(view), 1500);
                     } else if (extracting) {
-                        showNetError();
+                        advanceWebViewChannel(view);
                     }
                 });
     }
@@ -650,7 +662,7 @@ public class MainActivity extends Activity {
         switching = false;
         retryOnClick = true;
         loadingBar.setVisibility(View.GONE);
-        showLoading(true, "加载失败：网络通道异常\n\n点击屏幕重试");
+        showLoading(true, "加载失败：所有网络通道均不可达\n\n点击屏幕重试，或稍后再试（站点可能临时维护）");
         pageBadge.setText("!");
     }
 
