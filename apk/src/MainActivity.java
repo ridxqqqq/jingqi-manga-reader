@@ -84,6 +84,12 @@ public class MainActivity extends Activity {
     private boolean readerVisible = false;
     private volatile boolean retryOnClick = false;
     private volatile boolean switching = false; // 翻话/加载进行中，防重复触发
+    // WebView 备用通道状态：章节页 HTTP 通道全部失败后，用浏览器引擎自身抓取
+    private volatile boolean extracting = false;
+    private int extractTries = 0;
+    private int extractingIndex = -1;
+    private boolean webAltTried = false;
+    private Runnable extractTimeout;
 
     static class Chapter {
         int pid;
@@ -150,9 +156,25 @@ public class MainActivity extends Activity {
         reader.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView view, String url) {
-                restoreProgress();
-                // 自动阅读进行中：换章/重试加载完成后用新章节的时间重新计时
-                if (autoReading) ui.postDelayed(() -> injectAuto(), 900);
+                if (extracting) {
+                    if (url != null && url.startsWith("http")) tryExtract(view);
+                } else {
+                    restoreProgress();
+                    // 自动阅读进行中：换章/重试加载完成后用新章节的时间重新计时
+                    if (autoReading) ui.postDelayed(() -> injectAuto(), 900);
+                }
+            }
+
+            @Override
+            public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
+                // 备用通道内某协议失败 → 换 http/https 再试一次
+                if (extracting && !webAltTried) {
+                    webAltTried = true;
+                    String u = failingUrl != null && failingUrl.startsWith("http")
+                            ? failingUrl : chapters.get(extractingIndex).url;
+                    if (u.startsWith("http://")) view.loadUrl("https://" + u.substring(7));
+                    else if (u.startsWith("https://")) view.loadUrl("http://" + u.substring(8));
+                }
             }
         });
         root.addView(reader, new FrameLayout.LayoutParams(
@@ -466,6 +488,11 @@ public class MainActivity extends Activity {
 
     private void showCatalog() {
         stopAutoRead(false);
+        if (extracting) {
+            extracting = false;
+            if (extractTimeout != null) ui.removeCallbacks(extractTimeout);
+            reader.getSettings().setBlockNetworkImage(false);
+        }
         readerVisible = false;
         saveProgressNow();
         reader.stopLoading();
@@ -500,67 +527,131 @@ public class MainActivity extends Activity {
 
         final String url = c.url;
         new Thread(() -> {
+            // 通道候选：http 主通道 + https 备用（站点 TLS 不稳定，但部分网络下可用）
+            java.util.LinkedHashSet<String> chans = new java.util.LinkedHashSet<String>();
+            chans.add(url);
+            if (url.startsWith("http://")) chans.add("https://" + url.substring(7));
             Exception lastErr = null;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                try {
-                    if (attempt > 0) Thread.sleep(1500L * attempt);
-                    HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-                    conn.setConnectTimeout(12000);
-                    conn.setReadTimeout(25000);
-                    conn.setInstanceFollowRedirects(true);
-                    conn.setRequestProperty("User-Agent", UA);
-                    conn.setRequestProperty("Accept", "*/*");
-                    conn.setRequestProperty("Referer", "http://m.gugu5.cc/");
-                    InputStream in = conn.getInputStream();
-                    ByteArrayOutputStream buf = new ByteArrayOutputStream();
-                    byte[] t = new byte[8192];
-                    int n;
-                    while ((n = in.read(t)) > 0) buf.write(t, 0, n);
-                    in.close();
-                    String html = decode(buf.toByteArray());
-                    Matcher m = P_MURL.matcher(html);
-                    if (!m.find()) throw new Exception("页面解析失败");
-                    byte[] decoded = Base64.decode(m.group(1).trim(), Base64.DEFAULT);
-                    String joined = new String(decoded, StandardCharsets.UTF_8);
-                    String[] parts = joined.split("\\$qingtiandy\\$");
-                    // 主源=接口原始地址（bzcdn：国内可达性好；2026-10 起站点已撤广告层）
-                    // 备源1=站点阅读器使用的 p8.taoman.cc（Cloudflare，部分移动网络不可达）
-                    // 备源2=s1/s2 互换，最后加 ?r=3 重试
-                    final List<String> imgs = new ArrayList<String>();
-                    final List<String> alts1 = new ArrayList<String>();
-                    final List<String> alts2 = new ArrayList<String>();
-                    for (String p : parts) {
-                        p = p.trim();
-                        if (!p.startsWith("http")) continue;
-                        imgs.add(p);
-                        alts1.add(p.matches("^https?://s[12]\\..*")
-                                ? p.replaceFirst("^https?://s[12]\\.[^/]+/", "https://p8.taoman.cc/") : "");
-                        String swap = "";
-                        if (p.startsWith("https://s2.")) swap = "https://s1." + p.substring(11);
-                        else if (p.startsWith("https://s1.")) swap = "https://s2." + p.substring(11);
-                        else if (p.startsWith("http://s2.")) swap = "http://s1." + p.substring(10);
-                        else if (p.startsWith("http://s1.")) swap = "http://s2." + p.substring(10);
-                        alts2.add(swap);
+            int attempt = 0;
+            for (String chan : chans) {
+                for (int pass = 0; pass < 2; pass++, attempt++) {
+                    try {
+                        if (attempt > 0) Thread.sleep(1200L * (pass + 1));
+                        HttpURLConnection conn = (HttpURLConnection) new URL(chan).openConnection();
+                        conn.setConnectTimeout(10000);
+                        conn.setReadTimeout(20000);
+                        conn.setInstanceFollowRedirects(true);
+                        conn.setRequestProperty("User-Agent", UA);
+                        conn.setRequestProperty("Accept", "*/*");
+                        conn.setRequestProperty("Referer", "http://m.gugu5.cc/");
+                        // 禁用长连接复用，避免 stale 连接导致 unexpected end of stream
+                        conn.setRequestProperty("Connection", "close");
+                        InputStream in = conn.getInputStream();
+                        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+                        byte[] t = new byte[8192];
+                        int n;
+                        while ((n = in.read(t)) > 0) buf.write(t, 0, n);
+                        in.close();
+                        String html = decode(buf.toByteArray());
+                        Matcher m = P_MURL.matcher(html);
+                        if (!m.find()) throw new Exception("页面解析失败");
+                        byte[] decoded = Base64.decode(m.group(1).trim(), Base64.DEFAULT);
+                        String joined = new String(decoded, StandardCharsets.UTF_8);
+                        final String[][] L = buildImgLists(joined);
+                        if (L[0].length == 0) throw new Exception("未找到图片");
+                        ui.post(() -> onChapterLoaded(index, L[0], L[1], L[2]));
+                        return;
+                    } catch (Exception e) {
+                        lastErr = e;
                     }
-                    if (imgs.isEmpty()) throw new Exception("未找到图片");
-                    final String[] fi = imgs.toArray(new String[0]);
-                    final String[] f1 = alts1.toArray(new String[0]);
-                    final String[] f2 = alts2.toArray(new String[0]);
-                    ui.post(() -> onChapterLoaded(index, fi, f1, f2));
-                    return;
-                } catch (Exception e) {
-                    lastErr = e;
                 }
             }
-            final Exception fe = lastErr;
-            ui.post(() -> {
-                switching = false;
-                retryOnClick = true;
-                loadingBar.setVisibility(View.GONE);
-                showLoading(true, "加载失败：" + fe.getMessage() + "\n\n点击屏幕重试");
-                pageBadge.setText("!");
-            });
+            // 所有 HTTP 通道失败 → WebView 浏览器引擎通道（网络栈不同，可绕过连接重置）
+            ui.post(() -> startWebViewExtraction(index));
         }).start();
+    }
+
+    private String[][] buildImgLists(String joined) {
+        String[] parts = joined.split("\\$qingtiandy\\$");
+        List<String> imgs = new ArrayList<String>();
+        List<String> alts1 = new ArrayList<String>();
+        List<String> alts2 = new ArrayList<String>();
+        for (String p : parts) {
+            p = p.trim();
+            if (!p.startsWith("http")) continue;
+            imgs.add(p);
+            alts1.add(p.matches("^https?://s[12]\\..*")
+                    ? p.replaceFirst("^https?://s[12]\\.[^/]+/", "https://p8.taoman.cc/") : "");
+            String swap = "";
+            if (p.startsWith("https://s2.")) swap = "https://s1." + p.substring(11);
+            else if (p.startsWith("https://s1.")) swap = "https://s2." + p.substring(11);
+            else if (p.startsWith("http://s2.")) swap = "http://s1." + p.substring(10);
+            else if (p.startsWith("http://s1.")) swap = "http://s2." + p.substring(10);
+            alts2.add(swap);
+        }
+        return new String[][]{imgs.toArray(new String[0]), alts1.toArray(new String[0]), alts2.toArray(new String[0])};
+    }
+
+    private void startWebViewExtraction(int index) {
+        if (index < 0 || index >= chapters.size()) return;
+        extracting = true;
+        extractTries = 0;
+        extractingIndex = index;
+        webAltTried = false;
+        showLoading(true, "正在加载 " + chapters.get(index).title + "（备用通道）");
+        reader.getSettings().setBlockNetworkImage(true);
+        reader.loadUrl(chapters.get(index).url);
+        extractTimeout = () -> {
+            if (extracting) showNetError();
+        };
+        ui.postDelayed(extractTimeout, 25000);
+    }
+
+    private void tryExtract(WebView view) {
+        view.evaluateJavascript(
+                "(function(){var e='';" +
+                "try{if(typeof qTcms_S_m_murl_e!=='undefined')e=qTcms_S_m_murl_e;}catch(x){}" +
+                "if(!e||e.length<50){try{if(typeof qTcms_S_m_murl_e2!=='undefined')e=qTcms_S_m_murl_e2;}catch(x){}}" +
+                "if(!e||e.length<50){try{if(typeof qTcms_S_m_murl_e3!=='undefined')e=qTcms_S_m_murl_e3;}catch(x){}}" +
+                "return e;})()",
+                value -> {
+                    String s = value == null ? "" : value.replace("\"", "").trim();
+                    if (extracting && s.length() > 50) {
+                        extracting = false;
+                        if (extractTimeout != null) ui.removeCallbacks(extractTimeout);
+                        final String b64 = s;
+                        final int fIndex = extractingIndex;
+                        new Thread(() -> {
+                            try {
+                                byte[] decoded = Base64.decode(b64, Base64.DEFAULT);
+                                String joined = new String(decoded, StandardCharsets.UTF_8);
+                                final String[][] L = buildImgLists(joined);
+                                if (L[0].length == 0) throw new Exception("未找到图片");
+                                ui.post(() -> {
+                                    reader.getSettings().setBlockNetworkImage(false);
+                                    onChapterLoaded(fIndex, L[0], L[1], L[2]);
+                                });
+                            } catch (Exception e) {
+                                ui.post(() -> showNetError());
+                            }
+                        }).start();
+                    } else if (extracting && extractTries++ < 6) {
+                        view.postDelayed(() -> tryExtract(view), 1500);
+                    } else if (extracting) {
+                        showNetError();
+                    }
+                });
+    }
+
+    private void showNetError() {
+        extracting = false;
+        if (extractTimeout != null) ui.removeCallbacks(extractTimeout);
+        reader.getSettings().setBlockNetworkImage(false);
+        switching = false;
+        retryOnClick = true;
+        loadingBar.setVisibility(View.GONE);
+        showLoading(true, "加载失败：网络通道异常\n\n点击屏幕重试");
+        pageBadge.setText("!");
     }
 
     private void onChapterLoaded(int index, String[] imgs, String[] alts1, String[] alts2) {

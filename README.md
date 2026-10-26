@@ -2,7 +2,7 @@
 
 一个只为《中国惊奇先生（神鬼七杀令）》单部漫画服务的 Android 阅读器。打开即读、滑屏翻页、自动阅读、自动追更、记住进度。整个项目从零逆向站点接口到打包签名，只用 JDK + Android SDK 命令行工具完成，无 Gradle、无第三方依赖。
 
-**直接下载**：[`release/jingqi-v1.2.1.apk`](release/jingqi-v1.2.1.apk)（133 KB，Android 6.0+，签名 SHA-256 见下）
+**直接下载**：[`release/jingqi-v1.2.2.apk`](release/jingqi-v1.2.2.apk)（137 KB，Android 6.0+，签名 SHA-256 见下）
 
 ---
 
@@ -91,7 +91,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 │   ├── src/MainActivity.java  # 全部逻辑：目录解析 / WebView 阅读器 / 自动阅读 / 进度管理
 │   ├── assets/catalog.json    # 内置 1839 话目录（旧→新）
 │   └── res/                   # 图标、主题、网络安全配置
-└── release/jingqi-v1.2.1.apk  # 已签名安装包
+└── release/jingqi-v1.2.2.apk  # 已签名安装包
 ```
 
 ## 签名信息
@@ -112,6 +112,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | 1.1.2 | 图片源改写 `s1/s2.bzcdn.net → p8.taoman.cc`，去除图床广告烙印，加载提速约 27% |
 | 1.2.0 | 新增自动阅读 / 自动翻页（自适应匀速滚动 + 读完自动进下一话）与每章自定义阅读时间（章末点按、目录长按、全局默认） |
 | 1.2.1 | 修复图片打不开：bzcdn 原始地址回归主源（站点已撤广告层，与 taoman 逐字节一致），p8.taoman.cc / s1↔s2 互换降为逐级兜底；章节页请求 3 次重试应对间歇性 WAF 403；目录更新至 1839 话 |
+| 1.2.2 | 章节页请求多通道化：http/https 双协议 + Connection:close 防 stale 连接 + 全失败时自动降级 WebView 浏览器引擎抓取章节页（修复手机网络下 unexpected end of stream） |
 
 ## 免责声明
 
