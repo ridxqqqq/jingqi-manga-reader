@@ -500,56 +500,76 @@ public class MainActivity extends Activity {
 
         final String url = c.url;
         new Thread(() -> {
-            try {
-                HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-                conn.setConnectTimeout(12000);
-                conn.setReadTimeout(25000);
-                conn.setInstanceFollowRedirects(true);
-                conn.setRequestProperty("User-Agent", UA);
-                conn.setRequestProperty("Referer", "http://m.gugu5.cc/");
-                InputStream in = conn.getInputStream();
-                ByteArrayOutputStream buf = new ByteArrayOutputStream();
-                byte[] t = new byte[8192];
-                int n;
-                while ((n = in.read(t)) > 0) buf.write(t, 0, n);
-                in.close();
-                String html = decode(buf.toByteArray());
-                Matcher m = P_MURL.matcher(html);
-                if (!m.find()) throw new Exception("页面解析失败");
-                byte[] decoded = Base64.decode(m.group(1).trim(), Base64.DEFAULT);
-                String joined = new String(decoded, StandardCharsets.UTF_8);
-                String[] parts = joined.split("\\$qingtiandy\\$");
-                final List<String> imgs = new ArrayList<String>();
-                for (String p : parts) {
-                    p = p.trim();
-                    if (p.startsWith("http")) {
-                        // 与站点阅读器同款改写：s1/s2.bzcdn.net 是带广告注入的旧源，
-                        // 站点实际从 p8.taoman.cc 加载干净图（根因：截图中的“包子漫画”二维码广告）
-                        p = p.replaceAll("^https?://s[12]\\.[^/]+/scomic/", "https://p8.taoman.cc/scomic/");
+            Exception lastErr = null;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try {
+                    if (attempt > 0) Thread.sleep(1500L * attempt);
+                    HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+                    conn.setConnectTimeout(12000);
+                    conn.setReadTimeout(25000);
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setRequestProperty("User-Agent", UA);
+                    conn.setRequestProperty("Accept", "*/*");
+                    conn.setRequestProperty("Referer", "http://m.gugu5.cc/");
+                    InputStream in = conn.getInputStream();
+                    ByteArrayOutputStream buf = new ByteArrayOutputStream();
+                    byte[] t = new byte[8192];
+                    int n;
+                    while ((n = in.read(t)) > 0) buf.write(t, 0, n);
+                    in.close();
+                    String html = decode(buf.toByteArray());
+                    Matcher m = P_MURL.matcher(html);
+                    if (!m.find()) throw new Exception("页面解析失败");
+                    byte[] decoded = Base64.decode(m.group(1).trim(), Base64.DEFAULT);
+                    String joined = new String(decoded, StandardCharsets.UTF_8);
+                    String[] parts = joined.split("\\$qingtiandy\\$");
+                    // 主源=接口原始地址（bzcdn：国内可达性好；2026-10 起站点已撤广告层）
+                    // 备源1=站点阅读器使用的 p8.taoman.cc（Cloudflare，部分移动网络不可达）
+                    // 备源2=s1/s2 互换，最后加 ?r=3 重试
+                    final List<String> imgs = new ArrayList<String>();
+                    final List<String> alts1 = new ArrayList<String>();
+                    final List<String> alts2 = new ArrayList<String>();
+                    for (String p : parts) {
+                        p = p.trim();
+                        if (!p.startsWith("http")) continue;
                         imgs.add(p);
+                        alts1.add(p.matches("^https?://s[12]\\..*")
+                                ? p.replaceFirst("^https?://s[12]\\.[^/]+/", "https://p8.taoman.cc/") : "");
+                        String swap = "";
+                        if (p.startsWith("https://s2.")) swap = "https://s1." + p.substring(11);
+                        else if (p.startsWith("https://s1.")) swap = "https://s2." + p.substring(11);
+                        else if (p.startsWith("http://s2.")) swap = "http://s1." + p.substring(10);
+                        else if (p.startsWith("http://s1.")) swap = "http://s2." + p.substring(10);
+                        alts2.add(swap);
                     }
+                    if (imgs.isEmpty()) throw new Exception("未找到图片");
+                    final String[] fi = imgs.toArray(new String[0]);
+                    final String[] f1 = alts1.toArray(new String[0]);
+                    final String[] f2 = alts2.toArray(new String[0]);
+                    ui.post(() -> onChapterLoaded(index, fi, f1, f2));
+                    return;
+                } catch (Exception e) {
+                    lastErr = e;
                 }
-                if (imgs.isEmpty()) throw new Exception("未找到图片");
-                ui.post(() -> onChapterLoaded(index, imgs.toArray(new String[0])));
-            } catch (final Exception e) {
-                ui.post(() -> {
-                    switching = false;
-                    retryOnClick = true;
-                    loadingBar.setVisibility(View.GONE);
-                    showLoading(true, "加载失败：" + e.getMessage() + "\n\n点击屏幕重试");
-                    pageBadge.setText("!");
-                });
             }
+            final Exception fe = lastErr;
+            ui.post(() -> {
+                switching = false;
+                retryOnClick = true;
+                loadingBar.setVisibility(View.GONE);
+                showLoading(true, "加载失败：" + fe.getMessage() + "\n\n点击屏幕重试");
+                pageBadge.setText("!");
+            });
         }).start();
     }
 
-    private void onChapterLoaded(int index, String[] imgs) {
+    private void onChapterLoaded(int index, String[] imgs, String[] alts1, String[] alts2) {
         retryOnClick = false;
         switching = false;
         loadingBar.setVisibility(View.VISIBLE);
         showLoading(false, null);
         Chapter c = chapters.get(index);
-        renderReader(c, imgs);
+        renderReader(c, imgs, alts1, alts2);
         if (pendingRestoreImg > 0) {
             // 恢复模式：保留 last_img，等页面加载完跳回
             sp.edit().putInt("last_pid", c.pid).apply();
@@ -559,7 +579,7 @@ public class MainActivity extends Activity {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private void renderReader(Chapter c, String[] imgs) {
+    private void renderReader(Chapter c, String[] imgs, String[] alts1, String[] alts2) {
         StringBuilder sb = new StringBuilder();
         sb.append("<!DOCTYPE html><html><head><meta charset='utf-8'>");
         sb.append("<meta name='viewport' content='width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover'>");
@@ -574,9 +594,13 @@ public class MainActivity extends Activity {
         sb.append(".end b{display:block;color:#FF6B3D;font-size:16px;margin-bottom:8px;}");
         sb.append(".ctime{color:#5a6377;font:12px sans-serif;text-align:center;padding:0 0 80px;}");
         sb.append("</style></head><body>");
-        for (String u : imgs) {
+        for (int i = 0; i < imgs.length; i++) {
+            String u = imgs[i];
+            String a1 = i < alts1.length ? esc(alts1[i]) : "";
+            String a2 = i < alts2.length ? esc(alts2[i]) : "";
             sb.append("<div class='p'><span class='tip'>加载中…</span><img data-src='")
-              .append(u).append("' alt=''></div>");
+              .append(esc(u)).append("' data-a1='").append(a1)
+              .append("' data-a2='").append(a2).append("' alt=''></div>");
         }
         sb.append("<div class='end'><b>本章完</b>")
           .append(curIndex < chapters.size() - 1 ? "点按任意位置进入下一话" : "已是最新一话")
@@ -604,8 +628,11 @@ public class MainActivity extends Activity {
         sb.append("var tip=im.previousSibling;if(tip)tip.style.display='none';");
         sb.append("LOADED++;try{Android.page(LOADED,TOTAL);}catch(e){}});");
         sb.append("im.addEventListener('error',function(){");
-        sb.append("if(!im.retry){im.retry=1;im.src=im.getAttribute('data-src')+'&r=1';}");
-        sb.append("else{im.parentNode.querySelector('.tip').textContent='加载失败';}});");
+        sb.append("var tip=im.parentNode.querySelector('.tip');");
+        sb.append("if(!im.f1){im.f1=1;var a=im.getAttribute('data-a1');if(a){im.src=a;return;}}");
+        sb.append("if(!im.f2){im.f2=1;var b=im.getAttribute('data-a2');if(b){im.src=b;return;}}");
+        sb.append("if(!im.f3){im.f3=1;im.src=im.getAttribute('data-src')+'?r=3';return;}");
+        sb.append("if(tip)tip.textContent='加载失败';});");
         sb.append("});");
         // 点击手势：左 1/3 上一话（顶部），右 1/3 下一话（底部），其余切换顶栏
         sb.append("document.addEventListener('click',function(e){");
@@ -836,6 +863,10 @@ public class MainActivity extends Activity {
         } else {
             super.onBackPressed();
         }
+    }
+
+    private static String esc(String s) {
+        return s == null ? "" : s.replace("&", "&amp;").replace("'", "&#39;");
     }
 
     private String decode(byte[] b) {

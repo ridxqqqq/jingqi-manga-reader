@@ -23,7 +23,7 @@ Write-Host '== 2. aapt2 link =='
     -A (Join-Path $ws 'apk\assets') `
     --java (Join-Path $ws 'apk\gen') `
     --min-sdk-version 23 --target-sdk-version 34 `
-    --version-code 5 --version-name '1.2.0' `
+    --version-code 6 --version-name '1.2.1' `
     --auto-add-overlay `
     (Join-Path $OUT 'res.zip')
 Check 'aapt2 link'
